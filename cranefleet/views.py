@@ -72,6 +72,21 @@ def slew_view(console: "Console") -> dict[str, object]:
     }
 
 
+def slew_view_v2(console: "Console") -> dict[str, object]:
+    """Version 2 slew view: v1 fields plus ramp progress.
+
+    Everything v1 returned is preserved verbatim; ``ramp_remaining`` and
+    ``ramp_speed`` are additive only.
+    """
+
+    view = dict(slew_view(console))
+    view["ramp_remaining"] = round(
+        console.ramp.target_now() - console.ramp.velocity_now(), 6
+    )
+    view["ramp_speed"] = abs(console.ramp.velocity_now())
+    return view
+
+
 def trolley_view(console: "Console") -> dict[str, object]:
     trolley = console.trolley
     return {
@@ -143,6 +158,16 @@ def cluster_view(console: "Console") -> dict[str, object]:
     }
 
 
+def cluster_view_v2(console: "Console") -> dict[str, object]:
+    """Version 2 cluster view: v1 fields plus surveyed-crane summary."""
+
+    view = dict(cluster_view(console))
+    surveyed = sorted(fleet.current_positions(console.cluster))
+    view["surveyed_cranes"] = surveyed
+    view["crane_count"] = len(surveyed)
+    return view
+
+
 def nearest_pair_view(console: "Console") -> dict[str, object] | None:
     pair = fleet.nearest_pair(console.cluster)
     if pair is None:
@@ -211,15 +236,27 @@ def state_view(console: "Console") -> dict[str, object]:
     }
 
 
+def state_view_v2(console: "Console") -> dict[str, object]:
+    """Aggregate v2 snapshot: same sections as v1, v2 views add new fields."""
+
+    view = dict(state_view(console))
+    view["slew"] = slew_view_v2(console)
+    view["cluster"] = cluster_view_v2(console)
+    return view
+
+
 __all__ = [
     "cluster_view",
+    "cluster_view_v2",
     "crane_view",
     "hoist_view",
     "limit_view",
     "load_view",
     "nearest_pair_view",
     "slew_view",
+    "slew_view_v2",
     "state_view",
+    "state_view_v2",
     "trolley_view",
     "wind_view",
     "zone_view",

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import api
 from .console import Console, Request
 
 LOGGER = logging.getLogger("cranefleet.server")
@@ -48,49 +49,90 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         self._handle("POST")
 
+    def do_PUT(self) -> None:  # noqa: N802 - routed so unknown verbs get a 405
+        self._handle("PUT")
+
+    def do_PATCH(self) -> None:  # noqa: N802 - routed so unknown verbs get a 405
+        self._handle("PATCH")
+
+    def do_DELETE(self) -> None:  # noqa: N802 - routed so unknown verbs get a 405
+        self._handle("DELETE")
+
     def log_message(self, format: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.address_string(), format % args)
 
     def _handle(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path or "/"
-        if path.startswith("/api"):
-            body, valid = self._read_body()
-            request = Request(
-                method=method,
-                path=path,
-                query=parse_qs(parsed.query),
-                body=body,
-                body_valid=valid,
-            )
-            status, payload = self.server.console.dispatch(request)
-            self._write_json(status, payload)
+        if not api.is_api_path(path):
+            self._serve_static(path)
             return
-        self._serve_static(path)
+        try:
+            version, canonical = api.negotiate(
+                path, self.headers.get(api.API_VERSION_HEADER)
+            )
+        except api.ApiError as exc:
+            # Negotiation itself failed: answer in the latest envelope so an
+            # unknown future client still gets the classified error shape.
+            self._write_json(
+                exc.status, api.render_error(api.LATEST_VERSION, exc), api.LATEST_VERSION
+            )
+            return
+        body, valid, body_error = self._read_body()
+        request = Request(
+            method=method,
+            path=canonical,
+            query=parse_qs(parsed.query),
+            body=body,
+            body_valid=valid,
+            api_version=version,
+            body_error=body_error,
+        )
+        try:
+            status, payload = self.server.console.dispatch(request)
+        except api.ApiError as exc:  # defensive: dispatch renders these itself
+            status, payload = exc.status, api.render_error(version, exc)
+        self._write_json(status, payload, version)
 
-    def _read_body(self) -> tuple[dict[str, Any], bool]:
-        length = int(self.headers.get("Content-Length") or 0)
+    def _read_body(self) -> tuple[dict[str, Any], bool, str | None]:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}, False, api.BODY_MALFORMED
         if length <= 0:
-            return {}, True
+            return {}, True, None
         raw = self.rfile.read(length)
         try:
             parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return {}, False
+        except UnicodeDecodeError:
+            return {}, False, api.BODY_MALFORMED
+        except json.JSONDecodeError:
+            return {}, False, api.BODY_MALFORMED
         if not isinstance(parsed, dict):
-            return {}, False
-        return parsed, True
+            return {}, False, api.BODY_NOT_OBJECT
+        return parsed, True, None
 
-    def _write_json(self, status: int, payload: dict[str, Any]) -> None:
+    def _write_json(
+        self, status: int, payload: dict[str, Any], version: int = api.DEFAULT_VERSION
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header(api.API_VERSION_HEADER, str(version))
         self.end_headers()
         self.wfile.write(body)
 
     def _serve_static(self, path: str) -> None:
+        # Drain any request body so a keep-alive connection starts clean; only
+        # API POSTs normally carry one, but PUT/PATCH/DELETE may too.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 0:
+            self.rfile.read(length)
         web_root = Path(self.server.console.web_root).resolve()
         relative = posixpath.normpath(unquote(path).lstrip("/"))
         if relative in ("", "."):

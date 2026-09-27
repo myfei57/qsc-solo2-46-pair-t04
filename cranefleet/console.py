@@ -2,7 +2,13 @@
 
 Every HTTP route funnels into one method here so the interlocks stay in a
 single place. Handlers return ``(status_code, envelope)`` where the envelope
-is the ``{"ok": ...}`` document served to the console frontend.
+is built through :mod:`cranefleet.api` so its shape matches the version the
+client negotiated.
+
+Version 1 envelopes are frozen: version 1 returns ``{"ok": ..., "error": ...}``
+with the historical messages. Version 2 adds the classified error envelope
+(``error.code`` / ``error.message`` / ``error.details``) and additive view
+fields.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from . import api
 from . import cluster as fleet
 from . import config as site_config
 from . import crane as crane_module
@@ -49,6 +56,19 @@ Handler = Callable[["Request"], tuple[int, dict[str, Any]]]
 
 LOGGER = logging.getLogger("cranefleet.console")
 
+# Maps the domain interlock failures to their public, stable v2 error codes.
+# Version 1 still renders the human message only; the code is simply unused.
+_CONFLICT_CODES: dict[type[CraneFleetError], str] = {
+    ZoneNotDurable: api.ErrorCode.ZONE_NOT_DURABLE,
+    SlewBlocked: api.ErrorCode.SLEW_BLOCKED,
+    SlewBusy: api.ErrorCode.SLEW_BUSY,
+    SlewIdle: api.ErrorCode.SLEW_IDLE,
+    HookNotLowered: api.ErrorCode.HOOK_NOT_LOWERED,
+    HoistBusy: api.ErrorCode.HOIST_BUSY,
+    FeedbackNotConfirmed: api.ErrorCode.FEEDBACK_NOT_CONFIRMED,
+    SlewStopNotAcknowledged: api.ErrorCode.SLEW_STOP_NOT_ACKNOWLEDGED,
+}
+
 
 @dataclass(frozen=True)
 class Request:
@@ -59,6 +79,9 @@ class Request:
     query: dict[str, list[str]] = field(default_factory=dict)
     body: dict[str, Any] = field(default_factory=dict)
     body_valid: bool = True
+    api_version: int = api.DEFAULT_VERSION
+    body_error: str | None = None
+    """Why the body could not be parsed (one of the ``BODY_*`` constants), if at all."""
 
     def query_first(self, name: str, default: str | None = None) -> str | None:
         values = self.query.get(name)
@@ -68,14 +91,6 @@ class Request:
 
     def query_all(self, name: str) -> list[str]:
         return list(self.query.get(name, []))
-
-
-def ok(data: Any) -> dict[str, Any]:
-    return {"ok": True, "data": data}
-
-
-def fail(message: str) -> dict[str, Any]:
-    return {"ok": False, "error": message}
 
 
 class Console:
@@ -162,28 +177,116 @@ class Console:
     def dispatch(self, request: Request) -> tuple[int, dict[str, Any]]:
         handler = self._routes.get((request.method, request.path))
         if handler is None:
-            return 404, fail("not found")
-        return handler(request)
+            # v2 distinguishes "no such endpoint" from "wrong verb"; v1 keeps
+            # the historical 404 for both so old clients see no change.
+            allowed = sorted(
+                method for (method, path) in self._routes if path == request.path
+            )
+            if allowed and request.api_version >= api.V2:
+                error = api.ApiError(
+                    405,
+                    api.ErrorCode.METHOD_NOT_ALLOWED,
+                    f"{request.method} is not allowed for {request.path}",
+                    {"allowed": allowed},
+                )
+            else:
+                error = api.ApiError(404, api.ErrorCode.RESOURCE_NOT_FOUND, "not found")
+            return error.status, api.render_error(request.api_version, error)
+        try:
+            return handler(request)
+        except api.ApiError as exc:
+            return exc.status, api.render_error(request.api_version, exc)
+
+    # ------------------------------------------------------------- envelopes
+
+    def _ok(self, request: Request, data: Any) -> tuple[int, dict[str, Any]]:
+        return 200, api.render_ok(request.api_version, data)
+
+    def _state_view(self, request: Request) -> dict[str, object]:
+        if request.api_version >= api.V2:
+            return views.state_view_v2(self)
+        return views.state_view(self)
+
+    def _slew_view(self, request: Request) -> dict[str, object]:
+        if request.api_version >= api.V2:
+            return views.slew_view_v2(self)
+        return views.slew_view(self)
+
+    def _cluster_view(self, request: Request) -> dict[str, object]:
+        if request.api_version >= api.V2:
+            return views.cluster_view_v2(self)
+        return views.cluster_view(self)
+
+    def _require_object_body(self, request: Request) -> None:
+        """Fail requests whose body was not a JSON object.
+
+        v1 message stays the generic ``bad request``; v2 additionally reports
+        whether the bytes were malformed or simply not a JSON object.
+        """
+
+        if request.body_valid:
+            return
+        reason = request.body_error or api.BODY_MALFORMED
+        raise api.ApiError(
+            400,
+            api.ErrorCode.INVALID_BODY,
+            "bad request",
+            {"reason": reason},
+        )
+
+    def _number_field(self, request: Request, name: str, raw: Any) -> float:
+        """Read a numeric field.
+
+        v1 coerces garbage to ``0.0`` (its historical, lenient behaviour); v2
+        rejects an unparseable value with a validation error so the caller
+        learns which field was wrong instead of silently getting zero.
+        """
+
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            if request.api_version < api.V2:
+                return 0.0
+            raise api.ApiError(
+                400,
+                api.ErrorCode.VALIDATION_ERROR,
+                f"{name} must be a number",
+                {"field": name, "received": raw},
+            )
+
+    def _conflict(
+        self, exc: CraneFleetError, message: str, code: str = api.ErrorCode.STATE_CONFLICT
+    ) -> api.ApiError:
+        return api.ApiError(409, code, message)
 
     # ------------------------------------------------------------------ state
 
     def handle_state(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.state_view(self))
+        return self._ok(request, self._state_view(request))
 
     def handle_zone_state(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.zone_view(self))
+        return self._ok(request, views.zone_view(self))
 
     def handle_zone_occupy(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        self._require_object_body(request)
         crane_id = str(request.body.get("crane_id") or "")
         if not crane_id:
-            return 400, fail("crane_id required")
+            raise api.ApiError(
+                400,
+                api.ErrorCode.MISSING_FIELD,
+                "crane_id required",
+                {"field": "crane_id"},
+            )
         zone_module.occupy(self.zone, crane_id)
         try:
             zone_module.persist(self.zone, self.store)
         except StoreError as exc:
-            return 500, fail(str(exc))
+            raise api.ApiError(
+                500,
+                api.ErrorCode.STORE_UNAVAILABLE,
+                str(exc),
+                {"operation": "zone_persist"},
+            ) from exc
         conflicts, mismatches = fleet.check_conflicts(
             self.cluster, self.zone, self.config.safe_separation
         )
@@ -194,24 +297,24 @@ class Console:
             self.audit.record(crane_id, "zone-conflict", "pair detected")
         if mismatches:
             self.audit.record(crane_id, "occupancy-reconcile", "mismatch")
-        return 200, ok(
+        return self._ok(
+            request,
             {
                 "occupants": zone_module.occupants_snapshot(self.zone),
                 "conflicts": [conflict.to_dict() for conflict in conflicts],
                 "mismatches": mismatches,
-            }
+            },
         )
 
     def handle_zone_vacate(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        self._require_object_body(request)
         crane_id = str(request.body.get("crane_id") or "")
         zone_module.vacate(self.zone, crane_id)
         try:
             zone_module.persist(self.zone, self.store)
         except StoreError as exc:
             LOGGER.debug("best-effort zone persist skipped after vacate: %s", exc)
-        return 200, ok(zone_module.occupants_snapshot(self.zone))
+        return self._ok(request, zone_module.occupants_snapshot(self.zone))
 
     def handle_zone_clear(self, request: Request) -> tuple[int, dict[str, Any]]:
         generation = zone_module.clear_conflict(self.zone, self.cluster)
@@ -223,92 +326,107 @@ class Console:
         except StoreError as exc:
             LOGGER.debug("best-effort zone persist skipped after clear: %s", exc)
         self.audit.record("system", "zone-clear", f"{self.zone.id} generation={generation}")
-        return 200, ok(views.zone_view(self))
+        return self._ok(request, views.zone_view(self))
 
     # ---------------------------------------------------------------- cluster
 
     def handle_cluster_survey(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.cluster_view(self))
+        return self._ok(request, self._cluster_view(request))
 
     def handle_cluster_survey_post(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        self._require_object_body(request)
         points = _parse_points(request.body.get("cranes"))
         if points is None:
-            return 400, fail("bad request")
+            raise api.ApiError(
+                400,
+                api.ErrorCode.VALIDATION_ERROR,
+                "bad request",
+                {"field": "cranes"},
+            )
         fleet.survey(self.cluster, points)
         try:
             fleet.refresh_baseline(self.cluster, self.store)
         except StoreError as exc:
-            return 500, fail(str(exc))
+            raise api.ApiError(
+                500,
+                api.ErrorCode.STORE_UNAVAILABLE,
+                str(exc),
+                {"operation": "baseline_refresh"},
+            ) from exc
         self.audit.record("system", "cluster-survey", "baseline refreshed")
-        return 200, ok(views.cluster_view(self))
+        return self._ok(request, self._cluster_view(request))
 
     # ------------------------------------------------------------------- slew
 
     def handle_slew_start(self, request: Request) -> tuple[int, dict[str, Any]]:
         if zone_module.is_latched(self.zone):
-            return 409, fail("zone latch held")
+            raise api.ApiError(409, api.ErrorCode.ZONE_LATCHED, "zone latch held")
         try:
             slew_module.start(self.slew, self.zone, self.store, self.audit)
-        except ZoneNotDurable:
-            return 409, fail("zone state not durable")
-        except SlewBlocked:
-            return 409, fail("slew blocked by interlock")
-        except SlewBusy:
-            return 409, fail("slew already moving")
         except CraneFleetError as exc:
-            return 409, fail(str(exc))
-        return 200, ok(views.slew_view(self))
+            raise api.ApiError(
+                409,
+                _CONFLICT_CODES.get(type(exc), api.ErrorCode.STATE_CONFLICT),
+                _slew_start_message(exc),
+            ) from exc
+        return self._ok(request, self._slew_view(request))
 
     def handle_slew_stop(self, request: Request) -> tuple[int, dict[str, Any]]:
         slew_module.stop(self.slew, self.audit)
-        return 200, ok(views.slew_view(self))
+        return self._ok(request, self._slew_view(request))
 
     def handle_slew_target(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        self.ramp.set_target(_number(request.body.get("angle")))
+        self._require_object_body(request)
+        angle = self._number_field(request, "angle", request.body.get("angle"))
+        self.ramp.set_target(angle)
         self.ramp.step(0.1)
-        return 200, ok(views.slew_view(self))
+        return self._ok(request, self._slew_view(request))
 
     def handle_slew_fault(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        self._require_object_body(request)
         faulted = bool(request.body.get("faulted", True))
         slew_module.set_fault(self.slew, faulted)
         self.audit.record(self.slew.id, "slew-fault", f"faulted={str(faulted).lower()}")
-        return 200, ok(views.slew_view(self))
+        return self._ok(request, self._slew_view(request))
 
     # ------------------------------------------------------------------- wind
 
     def handle_wind_alarm(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        level = _number(request.body.get("level"))
+        self._require_object_body(request)
+        level = self._number_field(request, "level", request.body.get("level"))
         wind_module.set_level(self.wind, level)
         self.gust.observe(level)
         wind_module.latch_limits(self.wind, self.limit)
         try:
             wind_module.alarm(self.wind, self.slew, self.hoist, self.audit)
-        except SlewStopNotAcknowledged:
-            return 409, fail("slew stop was not acknowledged")
-        return 200, ok(views.wind_view(self))
+        except SlewStopNotAcknowledged as exc:
+            raise api.ApiError(
+                409,
+                api.ErrorCode.SLEW_STOP_NOT_ACKNOWLEDGED,
+                "slew stop was not acknowledged",
+            ) from exc
+        return self._ok(request, views.wind_view(self))
 
     def handle_wind_clear(self, request: Request) -> tuple[int, dict[str, Any]]:
         wind_module.clear(self.wind, self.limit)
         slew_module.release_wind_hold(self.slew)
-        return 200, ok(views.wind_view(self))
+        return self._ok(request, views.wind_view(self))
 
     # ------------------------------------------------------------------ crane
 
     def handle_crane_command(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        self._require_object_body(request)
         crane = self.crane(str(request.body.get("crane_id") or ""))
         if crane is None:
-            return 404, fail("crane not found")
-        command = crane_module.Command.from_dict(request.body)
+            raise api.ApiError(
+                404,
+                api.ErrorCode.RESOURCE_NOT_FOUND,
+                "crane not found",
+                {"resource": "crane"},
+            )
+        payload = dict(request.body)
+        payload["angle"] = self._number_field(request, "angle", payload.get("angle", 0.0))
+        command = crane_module.Command.from_dict(payload)
         if command.source == crane_module.SOURCE_REMOTE:
             crane_module.apply_remote(crane, command)
         else:
@@ -316,18 +434,18 @@ class Console:
         self._book_keeping(command)
         try:
             crane_module.execute(crane, self.slew, self.trolley, self.hoist, self.audit)
-        except SlewIdle:
-            return 409, fail("slew is idle")
-        except HookNotLowered:
-            return 409, fail("hook not lowered")
-        except HoistBusy:
-            return 409, fail("hoist busy")
+        except SlewIdle as exc:
+            raise self._conflict(exc, "slew is idle", api.ErrorCode.SLEW_IDLE)
+        except HookNotLowered as exc:
+            raise self._conflict(exc, "hook not lowered", api.ErrorCode.HOOK_NOT_LOWERED)
+        except HoistBusy as exc:
+            raise self._conflict(exc, "hoist busy", api.ErrorCode.HOIST_BUSY)
         if command.action == crane_module.ACTION_LOWER:
             try:
                 hoist_module.persist_hoist(self.hoist, self.store)
             except StoreError as exc:
                 LOGGER.debug("best-effort hoist persist skipped after lower: %s", exc)
-        return 200, ok(crane.last_command().to_dict())
+        return self._ok(request, crane.last_command().to_dict())
 
     def _book_keeping(self, command: crane_module.Command) -> None:
         if command.action == crane_module.ACTION_SWING:
@@ -343,77 +461,91 @@ class Console:
             self.load.update(-0.2, 0.1)
 
     def handle_crane_state(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.crane_view(self))
+        return self._ok(request, views.crane_view(self))
 
     def handle_crane_load(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.load_view(self))
+        return self._ok(request, views.load_view(self))
 
     def handle_crane_reset(self, request: Request) -> tuple[int, dict[str, Any]]:
         crane = self.default_crane()
         if crane is None:
-            return 404, fail("crane not found")
+            raise api.ApiError(
+                404,
+                api.ErrorCode.RESOURCE_NOT_FOUND,
+                "crane not found",
+                {"resource": "crane"},
+            )
         crane.clear_stop()
         limit_module.reset_arbitration(self.limit)
         self.audit.record(crane.id, "command-reset", "stops cleared")
-        return 200, ok(crane.last_command().to_dict())
+        return self._ok(request, crane.last_command().to_dict())
 
     # -------------------------------------------------------- trolley / hoist
 
     def handle_trolley_state(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.trolley_view(self))
+        return self._ok(request, views.trolley_view(self))
 
     def handle_trolley_resume(self, request: Request) -> tuple[int, dict[str, Any]]:
         try:
             trolley_module.move_resume(self.trolley, self.hoist, self.store)
             hoist_module.resume_release(self.hoist, self.feedback, self.store)
-        except HookNotLowered:
-            return 409, fail("hook not lowered")
-        except FeedbackNotConfirmed:
-            return 409, fail("feedback not confirmed")
-        return 200, ok(
-            {"trolley": views.trolley_view(self), "hoist": views.hoist_view(self)}
+        except HookNotLowered as exc:
+            raise self._conflict(exc, "hook not lowered", api.ErrorCode.HOOK_NOT_LOWERED)
+        except FeedbackNotConfirmed as exc:
+            raise self._conflict(
+                exc, "feedback not confirmed", api.ErrorCode.FEEDBACK_NOT_CONFIRMED
+            )
+        return self._ok(
+            request, {"trolley": views.trolley_view(self), "hoist": views.hoist_view(self)}
         )
 
     def handle_hoist_state(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.hoist_view(self))
+        return self._ok(request, views.hoist_view(self))
 
     def handle_hoist_payout(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        self.drum.pay_out(_number(request.body.get("length")))
-        return 200, ok(views.hoist_view(self))
+        self._require_object_body(request)
+        length = self._number_field(request, "length", request.body.get("length"))
+        self.drum.pay_out(length)
+        return self._ok(request, views.hoist_view(self))
 
     def handle_hoist_feedback(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        self.feedback.confirm(_number(request.body.get("speed")))
+        self._require_object_body(request)
+        speed = self._number_field(request, "speed", request.body.get("speed"))
+        self.feedback.confirm(speed)
         try:
             slew_module.persist_feedback(self.feedback, self.store)
         except StoreError as exc:
-            return 500, fail(str(exc))
+            raise api.ApiError(
+                500,
+                api.ErrorCode.STORE_UNAVAILABLE,
+                str(exc),
+                {"operation": "feedback_persist"},
+            ) from exc
         self.audit.record(self.hoist.id, "speed-feedback", "confirmed")
-        return 200, ok(views.hoist_view(self))
+        return self._ok(request, views.hoist_view(self))
 
     def handle_hoist_release(self, request: Request) -> tuple[int, dict[str, Any]]:
         try:
             hoist_module.release_brake(self.hoist, self.feedback)
-        except FeedbackNotConfirmed:
-            return 409, fail("feedback not confirmed")
+        except FeedbackNotConfirmed as exc:
+            raise self._conflict(
+                exc, "feedback not confirmed", api.ErrorCode.FEEDBACK_NOT_CONFIRMED
+            )
         try:
             slew_module.persist_feedback(self.feedback, self.store)
         except StoreError as exc:
             LOGGER.debug("best-effort feedback persist skipped after release: %s", exc)
-        return 200, ok(views.hoist_view(self))
+        return self._ok(request, views.hoist_view(self))
 
     def handle_hoist_stop(self, request: Request) -> tuple[int, dict[str, Any]]:
         hoist_module.stop(self.hoist, self.audit)
         hoist_module.engage_brake(self.hoist)
-        return 200, ok(views.hoist_view(self))
+        return self._ok(request, views.hoist_view(self))
 
     # ------------------------------------------------------------------ limit
 
     def handle_limit_state(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(views.limit_view(self))
+        return self._ok(request, views.limit_view(self))
 
     def handle_limit_check(self, request: Request) -> tuple[int, dict[str, Any]]:
         positions = fleet.current_positions(self.cluster)
@@ -439,31 +571,36 @@ class Console:
                 self.limit, self.slew, self.trolley, self.hoist
             )
             self.audit.record("system", "limit-enforce", "axes=" + ",".join(exceeded))
-        return 200, ok(
+        return self._ok(
+            request,
             {
                 "exceeded": exceeded,
                 "margins": limit_module.envelope_margins(envelopes),
                 "limit": views.limit_view(self),
                 "arbitration": arbitration.to_dict() if arbitration else None,
-            }
+            },
         )
 
     # ---------------------------------------------------------------- console
 
     def handle_config(self, request: Request) -> tuple[int, dict[str, Any]]:
-        return 200, ok(site_config.config_view(self.config, self.cluster))
+        return self._ok(request, site_config.config_view(self.config, self.cluster))
 
     def handle_config_save(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        self._require_object_body(request)
         try:
             updated = SiteConfig.from_dict(request.body)
         except ConfigError as exc:
-            return 400, fail(str(exc))
+            raise api.ApiError(
+                400,
+                api.ErrorCode.VALIDATION_ERROR,
+                str(exc),
+                {"field": "config"},
+            ) from exc
         self.config = updated
         site_config.save_config(self.store, updated)
         self.audit.record("system", "config-save", updated.site_name)
-        return 200, ok(site_config.config_view(updated, self.cluster))
+        return self._ok(request, site_config.config_view(updated, self.cluster))
 
     def handle_audit(self, request: Request) -> tuple[int, dict[str, Any]]:
         crane_id = request.query_first("crane") or ""
@@ -473,14 +610,19 @@ class Console:
             entries = self.audit.filter_by_actions(actions)[:limit]
         else:
             entries = self.audit.query(crane_id, limit)
-        return 200, ok([entry.to_dict() for entry in entries])
+        return self._ok(request, [entry.to_dict() for entry in entries])
 
 
-def _number(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+def _slew_start_message(exc: CraneFleetError) -> str:
+    """The historical v1 wording for each ``/api/slew/start`` rejection."""
+
+    if isinstance(exc, ZoneNotDurable):
+        return "zone state not durable"
+    if isinstance(exc, SlewBlocked):
+        return "slew blocked by interlock"
+    if isinstance(exc, SlewBusy):
+        return "slew already moving"
+    return str(exc)
 
 
 def _positive_int(value: str | None, fallback: int) -> int:

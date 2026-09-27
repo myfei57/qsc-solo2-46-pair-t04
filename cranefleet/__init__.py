@@ -1,6 +1,7 @@
 """Site fleet interlock and coordination backend."""
 
 from . import (
+    api,
     audit,
     cluster,
     config,
@@ -20,6 +21,7 @@ from .wiring import App, build_app
 
 __all__ = [
     "App",
+    "api",
     "audit",
     "build_app",
     "cluster",
