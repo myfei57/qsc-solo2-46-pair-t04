@@ -15,6 +15,8 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .console import Console, Request
+from .errors import ERR_UNKNOWN_VERSION, error_body
+from .versions import LATEST_VERSION, SUPPORTED_VERSIONS, split_api_path
 
 LOGGER = logging.getLogger("cranefleet.server")
 
@@ -55,13 +57,24 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path or "/"
         if path.startswith("/api"):
+            version, canonical_path = split_api_path(path)
+            if version is None:
+                supported = ", ".join(f"v{number}" for number in SUPPORTED_VERSIONS)
+                error = error_body(
+                    ERR_UNKNOWN_VERSION,
+                    f"unsupported API version; supported versions are {supported}",
+                    {"supported_versions": list(SUPPORTED_VERSIONS)},
+                )
+                self._write_json(404, {"ok": False, "api_version": LATEST_VERSION, "error": error})
+                return
             body, valid = self._read_body()
             request = Request(
                 method=method,
-                path=path,
+                path=canonical_path,
                 query=parse_qs(parsed.query),
                 body=body,
                 body_valid=valid,
+                version=version,
             )
             status, payload = self.server.console.dispatch(request)
             self._write_json(status, payload)
@@ -69,7 +82,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         self._serve_static(path)
 
     def _read_body(self) -> tuple[dict[str, Any], bool]:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}, False
         if length <= 0:
             return {}, True
         raw = self.rfile.read(length)

@@ -1,10 +1,51 @@
 """Domain failures raised by the control service.
 
 Every failure carries a stable type so the HTTP layer can map it to a status
-code without inspecting message text.
+code without inspecting message text. Request rejections raised by the API
+layer itself use :class:`ApiRejection`, which pairs an HTTP status with one
+of the stable ``ERR_*`` codes below so clients can branch on the category
+instead of parsing message text.
 """
 
 from __future__ import annotations
+
+# Stable error codes served in the ``error.code`` field of the API envelope.
+ERR_INVALID_JSON = "invalid_json"
+ERR_MISSING_FIELD = "missing_field"
+ERR_INVALID_FIELD = "invalid_field"
+ERR_NOT_FOUND = "not_found"
+ERR_CONFLICT = "conflict"
+ERR_INTERNAL = "internal"
+ERR_UNKNOWN_VERSION = "unknown_version"
+
+
+def error_body(code: str, message: str, details: dict | None = None) -> dict:
+    """Build the structured ``error`` object served to version-2 clients."""
+
+    body: dict = {"code": code, "message": message}
+    if details:
+        body["details"] = details
+    return body
+
+
+class ApiRejection(Exception):
+    """A request rejected by the API layer with a stable category code."""
+
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        details: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details
+
+    def body(self) -> dict:
+        return error_body(self.code, self.message, self.details)
 
 
 class CraneFleetError(Exception):

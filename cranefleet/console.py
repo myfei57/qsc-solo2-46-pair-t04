@@ -3,6 +3,12 @@
 Every HTTP route funnels into one method here so the interlocks stay in a
 single place. Handlers return ``(status_code, envelope)`` where the envelope
 is the ``{"ok": ...}`` document served to the console frontend.
+
+Versioning: handlers always produce the latest (v2) shape — full views and
+structured ``{"code", "message"}`` errors. :meth:`Console.dispatch` then
+shapes the response for the requested version: v1 responses are projected
+down to the frozen field whitelist and carry plain-string errors, exactly as
+the legacy clients have always seen them.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from . import hoist as hoist_module
 from . import limit as limit_module
 from . import slew as slew_module
 from . import trolley as trolley_module
+from . import versions
 from . import views
 from . import wind as wind_module
 from . import zone as zone_module
@@ -26,16 +33,26 @@ from .cluster import Cluster
 from .config import ConfigError, SiteConfig
 from .crane import Crane
 from .errors import (
+    ERR_CONFLICT,
+    ERR_INTERNAL,
+    ERR_INVALID_FIELD,
+    ERR_INVALID_JSON,
+    ERR_MISSING_FIELD,
+    ERR_NOT_FOUND,
+    ApiRejection,
     CraneFleetError,
     FeedbackNotConfirmed,
     HoistBusy,
     HookNotLowered,
+    NoCranesSurveyed,
     SlewBlocked,
     SlewBusy,
     SlewIdle,
     SlewStopNotAcknowledged,
+    StaleRelease,
     StoreError,
     ZoneNotDurable,
+    error_body,
 )
 from .hoist import Drum, Hoist
 from .limit import Limit
@@ -49,6 +66,30 @@ Handler = Callable[["Request"], tuple[int, dict[str, Any]]]
 
 LOGGER = logging.getLogger("cranefleet.console")
 
+# Domain failures mapped to ``(status, code, message)`` in one place. The
+# messages are the exact strings v1 clients have always received.
+DOMAIN_FAILURES: dict[type[CraneFleetError], tuple[int, str, str]] = {
+    ZoneNotDurable: (409, ERR_CONFLICT, "zone state not durable"),
+    SlewBlocked: (409, ERR_CONFLICT, "slew blocked by interlock"),
+    SlewBusy: (409, ERR_CONFLICT, "slew already moving"),
+    SlewIdle: (409, ERR_CONFLICT, "slew is idle"),
+    HookNotLowered: (409, ERR_CONFLICT, "hook not lowered"),
+    HoistBusy: (409, ERR_CONFLICT, "hoist busy"),
+    FeedbackNotConfirmed: (409, ERR_CONFLICT, "feedback not confirmed"),
+    SlewStopNotAcknowledged: (409, ERR_CONFLICT, "slew stop was not acknowledged"),
+    NoCranesSurveyed: (409, ERR_CONFLICT, "no cranes surveyed"),
+    StaleRelease: (409, ERR_CONFLICT, "stale release generation"),
+}
+
+COMMAND_SOURCES = (crane_module.SOURCE_CAB, crane_module.SOURCE_REMOTE)
+COMMAND_ACTIONS = (
+    crane_module.ACTION_STOP,
+    crane_module.ACTION_SWING,
+    crane_module.ACTION_TROLLEY,
+    crane_module.ACTION_RAISE,
+    crane_module.ACTION_LOWER,
+)
+
 
 @dataclass(frozen=True)
 class Request:
@@ -59,6 +100,7 @@ class Request:
     query: dict[str, list[str]] = field(default_factory=dict)
     body: dict[str, Any] = field(default_factory=dict)
     body_valid: bool = True
+    version: int = versions.VERSION_1
 
     def query_first(self, name: str, default: str | None = None) -> str | None:
         values = self.query.get(name)
@@ -72,10 +114,6 @@ class Request:
 
 def ok(data: Any) -> dict[str, Any]:
     return {"ok": True, "data": data}
-
-
-def fail(message: str) -> dict[str, Any]:
-    return {"ok": False, "error": message}
 
 
 class Console:
@@ -160,10 +198,48 @@ class Console:
         return self.cranes.get(crane_id)
 
     def dispatch(self, request: Request) -> tuple[int, dict[str, Any]]:
+        """Route one request and shape the envelope for its API version."""
+
         handler = self._routes.get((request.method, request.path))
         if handler is None:
-            return 404, fail("not found")
-        return handler(request)
+            status, envelope = 404, self._reject(ERR_NOT_FOUND, "not found")
+        else:
+            try:
+                status, envelope = handler(request)
+            except ApiRejection as exc:
+                status, envelope = exc.status, self._reject(exc.code, exc.message, exc.details)
+            except CraneFleetError as exc:
+                status, envelope = self._domain_failure(exc)
+            except Exception:  # noqa: BLE001 - never drop the connection on a client
+                LOGGER.exception("unhandled error while serving %s %s", request.method, request.path)
+                status, envelope = 500, self._reject(ERR_INTERNAL, "internal error")
+        return self._shape_response(request, status, envelope)
+
+    def _reject(self, code: str, message: str, details: dict | None = None) -> dict[str, Any]:
+        return {"ok": False, "error": error_body(code, message, details)}
+
+    def _domain_failure(self, exc: CraneFleetError) -> tuple[int, dict[str, Any]]:
+        for error_type, (status, code, message) in DOMAIN_FAILURES.items():
+            if isinstance(exc, error_type):
+                return status, self._reject(code, message)
+        if isinstance(exc, ConfigError):
+            return 400, self._reject(ERR_INVALID_FIELD, str(exc))
+        if isinstance(exc, StoreError):
+            return 500, self._reject(ERR_INTERNAL, str(exc))
+        return 409, self._reject(ERR_CONFLICT, str(exc))
+
+    def _shape_response(
+        self, request: Request, status: int, envelope: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if request.version != versions.VERSION_1:
+            return status, {"api_version": request.version, **envelope}
+        if envelope.get("ok"):
+            return status, {"ok": True, "data": versions.project_v1(request.path, envelope["data"])}
+        error = envelope.get("error")
+        if isinstance(error, dict):
+            # v1 clients receive the plain message string they always have.
+            envelope = {"ok": False, "error": error["message"]}
+        return status, envelope
 
     # ------------------------------------------------------------------ state
 
@@ -174,16 +250,12 @@ class Console:
         return 200, ok(views.zone_view(self))
 
     def handle_zone_occupy(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        _require_body(request)
         crane_id = str(request.body.get("crane_id") or "")
         if not crane_id:
-            return 400, fail("crane_id required")
+            raise ApiRejection(400, ERR_MISSING_FIELD, "crane_id required", {"field": "crane_id"})
         zone_module.occupy(self.zone, crane_id)
-        try:
-            zone_module.persist(self.zone, self.store)
-        except StoreError as exc:
-            return 500, fail(str(exc))
+        zone_module.persist(self.zone, self.store)
         conflicts, mismatches = fleet.check_conflicts(
             self.cluster, self.zone, self.config.safe_separation
         )
@@ -203,8 +275,7 @@ class Console:
         )
 
     def handle_zone_vacate(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        _require_body(request)
         crane_id = str(request.body.get("crane_id") or "")
         zone_module.vacate(self.zone, crane_id)
         try:
@@ -231,16 +302,19 @@ class Console:
         return 200, ok(views.cluster_view(self))
 
     def handle_cluster_survey_post(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        points = _parse_points(request.body.get("cranes"))
+        _require_body(request)
+        if "cranes" not in request.body:
+            raise ApiRejection(400, ERR_MISSING_FIELD, "cranes required", {"field": "cranes"})
+        points = _parse_points(request.body.get("cranes"), strict=request.version >= 2)
         if points is None:
-            return 400, fail("bad request")
+            raise ApiRejection(
+                400,
+                ERR_INVALID_FIELD,
+                "cranes must map crane ids to numeric x/y coordinates",
+                {"field": "cranes"},
+            )
         fleet.survey(self.cluster, points)
-        try:
-            fleet.refresh_baseline(self.cluster, self.store)
-        except StoreError as exc:
-            return 500, fail(str(exc))
+        fleet.refresh_baseline(self.cluster, self.store)
         self.audit.record("system", "cluster-survey", "baseline refreshed")
         return 200, ok(views.cluster_view(self))
 
@@ -248,17 +322,8 @@ class Console:
 
     def handle_slew_start(self, request: Request) -> tuple[int, dict[str, Any]]:
         if zone_module.is_latched(self.zone):
-            return 409, fail("zone latch held")
-        try:
-            slew_module.start(self.slew, self.zone, self.store, self.audit)
-        except ZoneNotDurable:
-            return 409, fail("zone state not durable")
-        except SlewBlocked:
-            return 409, fail("slew blocked by interlock")
-        except SlewBusy:
-            return 409, fail("slew already moving")
-        except CraneFleetError as exc:
-            return 409, fail(str(exc))
+            raise ApiRejection(409, ERR_CONFLICT, "zone latch held")
+        slew_module.start(self.slew, self.zone, self.store, self.audit)
         return 200, ok(views.slew_view(self))
 
     def handle_slew_stop(self, request: Request) -> tuple[int, dict[str, Any]]:
@@ -266,15 +331,13 @@ class Console:
         return 200, ok(views.slew_view(self))
 
     def handle_slew_target(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        self.ramp.set_target(_number(request.body.get("angle")))
+        _require_body(request)
+        self.ramp.set_target(_number_request(request, "angle"))
         self.ramp.step(0.1)
         return 200, ok(views.slew_view(self))
 
     def handle_slew_fault(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        _require_body(request)
         faulted = bool(request.body.get("faulted", True))
         slew_module.set_fault(self.slew, faulted)
         self.audit.record(self.slew.id, "slew-fault", f"faulted={str(faulted).lower()}")
@@ -283,16 +346,12 @@ class Console:
     # ------------------------------------------------------------------- wind
 
     def handle_wind_alarm(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        level = _number(request.body.get("level"))
+        _require_body(request)
+        level = _number_request(request, "level")
         wind_module.set_level(self.wind, level)
         self.gust.observe(level)
         wind_module.latch_limits(self.wind, self.limit)
-        try:
-            wind_module.alarm(self.wind, self.slew, self.hoist, self.audit)
-        except SlewStopNotAcknowledged:
-            return 409, fail("slew stop was not acknowledged")
+        wind_module.alarm(self.wind, self.slew, self.hoist, self.audit)
         return 200, ok(views.wind_view(self))
 
     def handle_wind_clear(self, request: Request) -> tuple[int, dict[str, Any]]:
@@ -303,25 +362,20 @@ class Console:
     # ------------------------------------------------------------------ crane
 
     def handle_crane_command(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
+        _require_body(request)
         crane = self.crane(str(request.body.get("crane_id") or ""))
         if crane is None:
-            return 404, fail("crane not found")
-        command = crane_module.Command.from_dict(request.body)
+            raise ApiRejection(404, ERR_NOT_FOUND, "crane not found")
+        if request.version >= versions.VERSION_2:
+            command = _strict_command(request.body)
+        else:
+            command = crane_module.Command.from_dict(request.body)
         if command.source == crane_module.SOURCE_REMOTE:
             crane_module.apply_remote(crane, command)
         else:
             crane_module.apply_cab(crane, command)
         self._book_keeping(command)
-        try:
-            crane_module.execute(crane, self.slew, self.trolley, self.hoist, self.audit)
-        except SlewIdle:
-            return 409, fail("slew is idle")
-        except HookNotLowered:
-            return 409, fail("hook not lowered")
-        except HoistBusy:
-            return 409, fail("hoist busy")
+        crane_module.execute(crane, self.slew, self.trolley, self.hoist, self.audit)
         if command.action == crane_module.ACTION_LOWER:
             try:
                 hoist_module.persist_hoist(self.hoist, self.store)
@@ -351,7 +405,7 @@ class Console:
     def handle_crane_reset(self, request: Request) -> tuple[int, dict[str, Any]]:
         crane = self.default_crane()
         if crane is None:
-            return 404, fail("crane not found")
+            raise ApiRejection(404, ERR_NOT_FOUND, "crane not found")
         crane.clear_stop()
         limit_module.reset_arbitration(self.limit)
         self.audit.record(crane.id, "command-reset", "stops cleared")
@@ -363,13 +417,8 @@ class Console:
         return 200, ok(views.trolley_view(self))
 
     def handle_trolley_resume(self, request: Request) -> tuple[int, dict[str, Any]]:
-        try:
-            trolley_module.move_resume(self.trolley, self.hoist, self.store)
-            hoist_module.resume_release(self.hoist, self.feedback, self.store)
-        except HookNotLowered:
-            return 409, fail("hook not lowered")
-        except FeedbackNotConfirmed:
-            return 409, fail("feedback not confirmed")
+        trolley_module.move_resume(self.trolley, self.hoist, self.store)
+        hoist_module.resume_release(self.hoist, self.feedback, self.store)
         return 200, ok(
             {"trolley": views.trolley_view(self), "hoist": views.hoist_view(self)}
         )
@@ -378,27 +427,19 @@ class Console:
         return 200, ok(views.hoist_view(self))
 
     def handle_hoist_payout(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        self.drum.pay_out(_number(request.body.get("length")))
+        _require_body(request)
+        self.drum.pay_out(_number_request(request, "length"))
         return 200, ok(views.hoist_view(self))
 
     def handle_hoist_feedback(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        self.feedback.confirm(_number(request.body.get("speed")))
-        try:
-            slew_module.persist_feedback(self.feedback, self.store)
-        except StoreError as exc:
-            return 500, fail(str(exc))
+        _require_body(request)
+        self.feedback.confirm(_number_request(request, "speed"))
+        slew_module.persist_feedback(self.feedback, self.store)
         self.audit.record(self.hoist.id, "speed-feedback", "confirmed")
         return 200, ok(views.hoist_view(self))
 
     def handle_hoist_release(self, request: Request) -> tuple[int, dict[str, Any]]:
-        try:
-            hoist_module.release_brake(self.hoist, self.feedback)
-        except FeedbackNotConfirmed:
-            return 409, fail("feedback not confirmed")
+        hoist_module.release_brake(self.hoist, self.feedback)
         try:
             slew_module.persist_feedback(self.feedback, self.store)
         except StoreError as exc:
@@ -454,12 +495,8 @@ class Console:
         return 200, ok(site_config.config_view(self.config, self.cluster))
 
     def handle_config_save(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if not request.body_valid:
-            return 400, fail("bad request")
-        try:
-            updated = SiteConfig.from_dict(request.body)
-        except ConfigError as exc:
-            return 400, fail(str(exc))
+        _require_body(request)
+        updated = SiteConfig.from_dict(request.body)
         self.config = updated
         site_config.save_config(self.store, updated)
         self.audit.record("system", "config-save", updated.site_name)
@@ -474,6 +511,78 @@ class Console:
         else:
             entries = self.audit.query(crane_id, limit)
         return 200, ok([entry.to_dict() for entry in entries])
+
+
+def _require_body(request: Request) -> None:
+    """Reject a POST whose JSON body could not be parsed at all."""
+
+    if not request.body_valid:
+        raise ApiRejection(400, ERR_INVALID_JSON, "request body is not valid JSON")
+
+
+def _number_request(request: Request, field: str) -> float:
+    """Read a numeric body field, strictly for v2, leniently for v1.
+
+    v1 keeps the historical behaviour (missing or unparsable values become
+    ``0.0``); v2 rejects them with a classified request error.
+    """
+
+    value = request.body.get(field)
+    if request.version < versions.VERSION_2:
+        return _number(value)
+    if value is None:
+        raise ApiRejection(400, ERR_MISSING_FIELD, f"{field} required", {"field": field})
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ApiRejection(
+            400,
+            ERR_INVALID_FIELD,
+            f"{field} must be a number",
+            {"field": field, "value": value},
+        ) from None
+
+
+def _strict_command(payload: dict[str, Any]) -> crane_module.Command:
+    """Validate a crane command body for v2 clients."""
+
+    source = payload.get("source", crane_module.SOURCE_CAB)
+    if source not in COMMAND_SOURCES:
+        raise ApiRejection(
+            400,
+            ERR_INVALID_FIELD,
+            "source must be one of " + ", ".join(COMMAND_SOURCES),
+            {"field": "source", "value": source},
+        )
+    action = payload.get("action")
+    if action is None:
+        raise ApiRejection(400, ERR_MISSING_FIELD, "action required", {"field": "action"})
+    if action not in COMMAND_ACTIONS:
+        raise ApiRejection(
+            400,
+            ERR_INVALID_FIELD,
+            "action must be one of " + ", ".join(COMMAND_ACTIONS),
+            {"field": "action", "value": action},
+        )
+    axis = payload.get("axis", "")
+    if not isinstance(axis, str):
+        raise ApiRejection(
+            400,
+            ERR_INVALID_FIELD,
+            "axis must be a string",
+            {"field": "axis", "value": axis},
+        )
+    angle = payload.get("angle", 0.0)
+    try:
+        angle = float(angle)
+    except (TypeError, ValueError):
+        raise ApiRejection(
+            400,
+            ERR_INVALID_FIELD,
+            "angle must be a number",
+            {"field": "angle", "value": angle},
+        ) from None
+    return crane_module.Command(source=str(source), action=str(action), axis=axis, angle=angle)
 
 
 def _number(value: Any) -> float:
@@ -493,7 +602,7 @@ def _positive_int(value: str | None, fallback: int) -> int:
     return parsed if parsed > 0 else fallback
 
 
-def _parse_points(payload: Any) -> dict[str, Any] | None:
+def _parse_points(payload: Any, strict: bool = False) -> dict[str, Any] | None:
     from .geometry import Point
 
     if not isinstance(payload, dict):
@@ -502,6 +611,12 @@ def _parse_points(payload: Any) -> dict[str, Any] | None:
     for crane_id, raw in payload.items():
         if not isinstance(raw, dict):
             return None
+        if strict:
+            # v2: coordinates must be present and numeric, no coercion.
+            if "x" not in raw or "y" not in raw:
+                return None
+            if not all(isinstance(raw[axis], (int, float)) for axis in ("x", "y")):
+                return None
         try:
             points[str(crane_id)] = Point(float(raw["x"]), float(raw["y"]))
         except (KeyError, TypeError, ValueError):

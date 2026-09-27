@@ -6,11 +6,13 @@ frontend never reaches into the control objects directly.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from . import cluster as fleet
 from . import limit as limit_module
 from . import slew as slew_module
+from . import versions
 from . import zone as zone_module
 from .config import config_view
 from .geometry import compute_separation
@@ -192,6 +194,9 @@ def state_view(console: "Console") -> dict[str, object]:
         "zone-conflict"
     )
     latest_wind_stop = console.audit.latest("wind-slew-stop")
+    # New response fields go here, behind the current version. The v1
+    # whitelist in versions.py strips them for legacy clients, so adding
+    # fields to this view cannot break a client pinned to an older version.
     return {
         "zone": zone_view(console),
         "slew": slew_view(console),
@@ -208,6 +213,10 @@ def state_view(console: "Console") -> dict[str, object]:
         "alarms": alarm_count,
         "latest_wind_stop": latest_wind_stop.to_dict() if latest_wind_stop else None,
         "store": {"keys": store_count(console.store), "bytes": store_size(console.store)},
+        "meta": {
+            "api_version": versions.LATEST_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
     }
 
 
